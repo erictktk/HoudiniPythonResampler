@@ -1,0 +1,290 @@
+# This code is called when instances of this SOP cook.
+node = hou.pwd()
+geo = node.geometry()
+
+#######################
+#######################
+__author__ = 'eric'
+#######################
+#### PYTHON MODULE ####
+
+"""
+A node for resampling piecewise linear curves.  
+
+Includes the following functions:
+
+SingleResample (emulates standard Houdini functionality)
+MultiResample (for resampling with different gap lengths)
+RampResample (for parametric resampling using a ramp Parameter)
+RandomResample (not yet implemented)
+
+
+Every resample function uses the master function TrueResample.  There are other options available
+that are not yet implemented in the GUI of this node.
+
+The .hdalc file contains also the following nodes:
+
+Resample_CarveHelper  - for helping with separating Ramp Resamples and breaking them up into different curves
+Resample_IdentityCurve
+Resample_HalfCircle
+
+"""
+
+import hou
+import random
+
+
+def CopyPointAttribs(oldGeo, point, newPoint):
+    geo2 = newPoint.geometry()
+    for attrib in oldGeo.pointAttribs():
+        name = attrib.name()
+        if name != 'P':
+            value = point.attribValue( name )
+
+            if geo2.findPointAttrib(name) is None:
+                defaultValue = attrib.defaultValue()
+                geo2.addAttrib(hou.attribType.Point,name,defaultValue)
+
+            newPoint.setAttribValue(name,value)
+    return newPoint
+
+def Resample(geo, points, gap=.1, KeepVertices=True, doCurve=True):
+    return TrueResample( geo, points, KeepVertices, doCurve, 'Uniform', gap=gap)
+
+def MultiResample(geo, points, multiGap=[.2,.3], KeepVertices=True, doCurve=True):
+    return TrueResample( geo, points, KeepVertices, doCurve, 'MultiResample', multiGap=multiGap)
+
+def RangeRandomResample(geo, points, ranges = [.1, .6], KeepVertices=True, doCurve=True):
+    return TrueResample( geo, points, KeepVertices, doCurve, 'Small Random', ranges = ranges)
+
+def RandomResample(geo, points, maxDist=1.0, num=3, minDist=0, seed=0, KeepVertices=True, doCurve=True):
+    random.seed(seed)
+
+    dists = []
+    n = 0
+    iter = 0
+    while len(dists) < num and iter < 1000:
+        curDist =  random.uniform(0,1)
+
+        add = True
+        for d in dists:
+            if abs(d-curDist) < minDist:
+                add = False
+        if add:
+            dists.append(curDist)
+        iter += 1
+
+    dists.sort()
+    return TrueResample( geo, points, KeepVertices, doCurve, 'Random', dists = dists )
+
+def RampResample(geo, points, dists, KeepVertices=True, doCurve=True):
+    return TrueResample( geo, points, KeepVertices, doCurve, ResampleType ='Ramp', dists = dists)
+
+
+def TrueResample(geo, points, KeepVertices=True, doCurve=True, ResampleType='Uniform', keepCurve=True, gap=.1, multiGap=[.2,.3], ranges=[.1,.6] , dists=[], seed=10):
+    random.seed(seed)
+
+    newGeo = hou.Geometry()
+    oldGeo = points[0].geometry()
+    isClosed = False
+
+    geoOfPoints = points[0].geometry()
+    if geoOfPoints.prims()[0].isClosed():
+        isClosed = True
+
+    newGeo.addAttrib(hou.attribType.Point,'Corner',0)
+    newGeo.addAttrib(hou.attribType.Point,'oldPoint',-1)
+
+    cumuDist = [0.0]
+    npoints = len(points)
+    count = npoints-1
+    if isClosed:
+        count = npoints
+
+    for i in range(0, count):
+        v = points[(i+1)%npoints].position()-points[i].position()
+        dist = v.length()
+        cumuDist.append(  cumuDist[-1] + dist )
+
+    ###Parameterize cumuDist if Ramp ro Random
+    if ResampleType == 'Ramp' or ResampleType == 'Random':
+        cumuDist = [ c/cumuDist[-1] for c in cumuDist ]
+
+    ###Add first point###
+    newPoints = []
+    pos = points[0].position()
+    newPoint = newGeo.createPoint()
+    newPoint.setPosition(pos)
+    CopyPointAttribs(oldGeo,points[0],newPoint)
+    newPoint.setAttribValue('Corner', 1)
+    newPoint.setAttribValue('oldPoint', 0)
+    newPoints.append( newPoint )
+
+    ###Setup For Loop###
+    dist = 0
+    iter = 0
+    k = 0
+    prevK = 0
+    stop = 0
+    leftOver = False
+    leftOverGap = .01
+    curGap = 0
+
+    while dist < cumuDist[-1] and iter < 10000 and stop == 0:
+        if ResampleType == 'Uniform':
+            curGap = gap
+            dist += curGap
+        if ResampleType == 'MultiResample':
+            numGaps = len(multiGap)
+            curGap = multiGap[iter%numGaps]
+            dist += curGap
+        if ResampleType == 'Small Random':
+            curGap = random.uniform(ranges[0],ranges[1])
+            dist += curGap
+        if ResampleType == 'Ramp':
+            ### if ran out of dists ###
+            if iter > (len(dists) - 1):
+                dist = cumuDist[-1] + 1
+            else:
+                dist = dists[iter]
+        if ResampleType == 'Random':
+            if iter > (len(dists) - 1):
+                dist = cumuDist[-1] + 1
+            else:
+                dist = dists[iter]
+
+        ### if dist > last cumuDist, append the rest of the vertex points ###
+        if dist > cumuDist[-1]:
+            stop = True
+            for i in range(k+1,len(points)):
+                pos = points[i].position()
+                newPoint = newGeo.createPoint()
+                newPoint.setPosition(pos)
+                CopyPointAttribs(oldGeo, points[i], newPoint)
+                newPoint.setAttribValue('oldPoint', i)
+                newPoint.setAttribValue('Corner', 1)
+                newPoints.append(newPoint)
+            break
+
+        ### Find next edge ###
+        while k < len(cumuDist)-1:
+            if dist > (cumuDist[k]-.00001) and dist < ( cumuDist[k+1]+.00001 ) or k > prevK:
+                break
+            k += 1
+
+        if k > prevK and not stop:
+            if KeepVertices:
+                theIter = 0
+                while k < (len(cumuDist)) and theIter < 100:
+                    pos = points[k].position()
+                    newPoint = newGeo.createPoint()
+                    newPoint.setPosition(pos)
+                    newPoint.setAttribValue('oldPoint',k)
+                    newPoint.setAttribValue('Corner', 1)
+                    newPoints.append( newPoint )
+                    if dist > (cumuDist[k]-.00001) and dist < ( cumuDist[k+1]+.00001 ):
+                        break
+                    k += 1
+                    theIter += 1
+            prevK = k
+
+        if k < (len(points)) and not stop:
+            #### INTERPOLATION ####
+            paramRange = cumuDist[k+1]-cumuDist[k]
+            extraU = dist-cumuDist[k]
+            paramExtraU = extraU/paramRange
+
+            p0 = points[k].position()
+            p1 = points[(k+1)%npoints].position()
+
+            v = p1-p0
+            interruptingPoint = p0 + paramExtraU*v
+            ######################################
+
+            #### copy point and attribs ###
+            newPoint = newGeo.createPoint()
+            newPoint.setPosition( interruptingPoint )
+            CopyPointAttribs(oldGeo,points[k],newPoint)
+            newPoint.setAttribValue('Corner',0)
+            newPoints.append(newPoint)
+
+            iter += 1
+        else:
+            pass
+
+    newCurve = newGeo.createPolygon()
+    newCurve.setIsClosed(isClosed)
+    for p in newPoints:
+        newCurve.addVertex(p)
+
+    return newGeo
+    
+
+SINGLE, MULTI, RAMP, RANDOM = 0, 1, 2, 3
+TWO, THREE = 0, 1    
+
+
+resampleMenu = node.parm('ResampleMenu').eval()
+keepOldGeo = node.parm('keepOldGeo').eval()
+prims = geo.prims()
+
+gapRange1 = node.parm('gapRange1').eval()
+gapRange2 = node.parm('gapRange2').eval()
+
+seed = node.parm('seed').eval()
+
+random.seed(seed)
+
+newGeos = []
+for pr in prims:
+    pass 
+    
+    verts = pr.vertices()
+    curPoints = [ v.point() for v in verts ]
+    if resampleMenu == SINGLE:
+        length = node.parm('length').eval()
+        newGeo = Resample(geo, curPoints, length)
+        
+        newGeos.append(newGeo)
+        
+    elif resampleMenu == MULTI:
+        numLengths = node.parm('numLengths').eval()
+        
+        if numLengths == TWO:
+            #print "hey!"
+            lengths = [ node.parm('lengths2_0').eval(), node.parm('lengths2_1').eval() ]
+            newGeo = MultiResample(geo, curPoints, lengths)
+            
+        else:
+            lengths = [ node.parm('lengths3_0').eval(), node.parm('lengths3_1').eval(), node.parm('lengths3_2').eval() ]
+            newGeo = MultiResample(geo, curPoints, lengths)
+            
+        newGeos.append(newGeo)
+        
+   
+    elif resampleMenu == RAMP:
+        uRamp = node.parm('uRamp').eval()
+        
+        dists = [ u for u in uRamp.keys() ]
+        
+        if dists[0] < .000001:
+            dists.pop(0)
+        if dists[-1] > .9999:
+            dists.pop(-1)
+        
+        newGeo = RampResample(geo, curPoints, dists)
+        
+        newGeos.append(newGeo)
+        
+        
+    elif resampleMenu == RANDOM:
+        ### implement later ###
+        raise Exception('Random resample not yet implemented!')
+        
+        
+for g in newGeos:
+    geo.merge(g)
+    
+if not keepOldGeo:
+    geo.deletePrims(prims)
+    
